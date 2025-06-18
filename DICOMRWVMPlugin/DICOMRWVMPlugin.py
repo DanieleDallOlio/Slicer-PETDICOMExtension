@@ -3,6 +3,7 @@ import sys as SYS
 from __main__ import vtk, qt, ctk, slicer
 from DICOMLib import DICOMPlugin
 from DICOMLib import DICOMLoadable
+import logging
 
 if slicer.app.majorVersion >= 5 or (slicer.app.majorVersion == 4 and slicer.app.minorVersion >= 11):
   import pydicom
@@ -337,6 +338,312 @@ class DICOMRWVMPluginClass(DICOMPlugin):
       # create Subject Hierarchy nodes for the loaded series
       self.addSeriesInSubjectHierarchy(loadable,imageNode)
 
+    return imageNode
+
+  def loadPetMultiVolumeSeries(self, loadable):
+    """Use the conversion factor to load the volume into Slicer"""
+
+    conversionFactor = loadable.slope
+
+    multiVolumePlugin = slicer.modules.dicomPlugins['MultiVolumeImporterPlugin']()
+    mVLoadables = multiVolumePlugin.examine([loadable.files])
+    if len(mVLoadables) == 0:
+      raise OSError(f"Invalid input for multivolume importer")
+
+    if len(mVLoadables) > 1:
+      assert len(mVLoadables) == 2
+      mVLoadables = [mV for mV in  mVLoadables if hasattr(mV, 'loadAsVolumeSequence')]
+      assert len(mVLoadables) == 1
+    mVLoadable = mVLoadables[0]
+    # imageNode = multiVolumePlugin.load(mVLoadable)
+
+    mvNode = ''
+    try:
+      mvNode = mVLoadable.multivolume
+    except AttributeError:
+      return None
+
+    nFrames = int(mvNode.GetAttribute('MultiVolume.NumberOfFrames'))
+    files = mvNode.GetAttribute('MultiVolume.FrameFileList').split(',')
+    nFiles = len(files)
+    filesPerFrame = int(nFiles/nFrames)
+    frames = []
+
+    baseName = mVLoadable.name
+
+    loadAsVolumeSequence = hasattr(mVLoadable, 'loadAsVolumeSequence') and mVLoadable.loadAsVolumeSequence
+    if loadAsVolumeSequence:
+      volumeSequenceNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSequenceNode",
+        slicer.mrmlScene.GenerateUniqueName(baseName))
+      volumeSequenceNode.SetIndexName("")
+      volumeSequenceNode.SetIndexUnit("")
+      # Transfer all attributes from multivolume node to volume sequence node
+      for attrName in mvNode.GetAttributeNames():
+        volumeSequenceNode.SetAttribute(attrName, mvNode.GetAttribute(attrName))
+    else:
+      mvImage = vtk.vtkImageData()
+      mvImageArray = None
+
+    scalarVolumePlugin = slicer.modules.dicomPlugins['DICOMScalarVolumePlugin']()
+    instanceUIDs = ""
+    for file in files:
+      uid = slicer.dicomDatabase.fileValue(file,multiVolumePlugin.tags['instanceUID'])
+      if uid == "":
+        uid = "Unknown"
+      instanceUIDs += uid+" "
+    instanceUIDs = instanceUIDs[:-1]
+    mvNode.SetAttribute("DICOM.instanceUIDs", instanceUIDs)
+
+    progressbar = slicer.util.createProgressDialog(labelText="Loading "+baseName,
+                                                   value=0, maximum=nFrames,
+                                                   windowModality = qt.Qt.WindowModal)
+
+    try:
+      # read each frame into scalar volume
+      for frameNumber in range(nFrames):
+
+        progressbar.value = frameNumber
+        slicer.app.processEvents()
+        if progressbar.wasCanceled:
+          break
+
+        sNode = slicer.vtkMRMLVolumeArchetypeStorageNode()
+        sNode.ResetFileNameList()
+
+        frameFileList = files[frameNumber*filesPerFrame:(frameNumber+1)*filesPerFrame]
+        # sv plugin will sort the filenames by geometric order
+        svLoadables = scalarVolumePlugin.examine([frameFileList])
+
+        if len(svLoadables) == 0:
+          raise OSError(f"volume frame {frameNumber} is invalid")
+
+        frame = scalarVolumePlugin.load(svLoadables[0])
+
+        # Harden the acquisition transform if there is any
+        # (for example due to varying slice spacing)
+        # and then remove the transform from the scene
+        parentTransformNode = frame.GetParentTransformNode()
+        if parentTransformNode:
+          frame.HardenTransform()
+          slicer.mrmlScene.RemoveNode(parentTransformNode)
+
+        if frame == None or frame.GetImageData() == None:
+          raise OSError(f"Volume frame {frameNumber} is invalid - {svLoadables[0].warning}")
+
+        #
+        # SCALING
+        #
+        frame = self.conversion(loadable, frame, conversionFactor, frameFileList)
+
+        if loadAsVolumeSequence:
+          # Load into volume sequence
+
+          # volumeSequenceNode.SetDataNodeAtValue would deep-copy the volume frame.
+          # To avoid memory reallocation, add an empty node and shallow-copy the contents
+          # of the volume frame.
+
+          # Create an empty volume node in the sequence node
+          proxyVolume = slicer.mrmlScene.AddNewNodeByClass(frame.GetClassName())
+          indexValue = str(frameNumber)
+          volumeSequenceNode.SetDataNodeAtValue(proxyVolume, indexValue)
+          slicer.mrmlScene.RemoveNode(proxyVolume)
+
+          # Update the data node
+          shallowCopy = True
+          volumeSequenceNode.UpdateDataNodeAtValue(frame, indexValue, shallowCopy)
+
+        else:
+          # Load into multi-volume
+
+          if frameNumber == 0:
+            frameImage = frame.GetImageData()
+            frameExtent = frameImage.GetExtent()
+            frameSize = frameExtent[1]*frameExtent[3]*frameExtent[5]
+
+            mvImage.SetExtent(frameExtent)
+            mvImage.AllocateScalars(frame.GetImageData().GetScalarType(), nFrames)
+
+            mvImageArray = vtk.util.numpy_support.vtk_to_numpy(mvImage.GetPointData().GetScalars())
+
+            mvNode.SetScene(slicer.mrmlScene)
+
+            mat = vtk.vtkMatrix4x4()
+            frame.GetRASToIJKMatrix(mat)
+            mvNode.SetRASToIJKMatrix(mat)
+            frame.GetIJKToRASMatrix(mat)
+            mvNode.SetIJKToRASMatrix(mat)
+
+          frameImage = frame.GetImageData()
+          frameImageArray = vtk.util.numpy_support.vtk_to_numpy(frameImage.GetPointData().GetScalars())
+
+          mvImageArray.T[frameNumber] = frameImageArray
+
+        # Remove temporary volume node
+        if frame.GetDisplayNode():
+          slicer.mrmlScene.RemoveNode(frame.GetDisplayNode())
+        if frame.GetStorageNode():
+          slicer.mrmlScene.RemoveNode(frame.GetStorageNode())
+        slicer.mrmlScene.RemoveNode(frame)
+
+      if loadAsVolumeSequence:
+        # Finalize volume sequence import
+        # For user convenience, add a browser node and show the volume in the slice viewer.
+
+        # Add browser node
+        sequenceBrowserNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLSequenceBrowserNode',
+          slicer.mrmlScene.GenerateUniqueName(baseName + " browser"))
+        sequenceBrowserNode.SetAndObserveMasterSequenceNodeID(volumeSequenceNode.GetID())
+        # If save changes are allowed then proxy nodes are updated using shallow copy, which is much
+        # faster for images. Images are usually not modified, so the risk of accidentally modifying
+        # data in the sequence is low.
+        sequenceBrowserNode.SetSaveChanges(volumeSequenceNode, True)
+        # Show frame number in proxy volume node name
+        sequenceBrowserNode.SetOverwriteProxyName(volumeSequenceNode, True);
+
+        # Automatically select the volume to display
+        imageProxyVolumeNode = sequenceBrowserNode.GetProxyNode(volumeSequenceNode)
+        appLogic = slicer.app.applicationLogic()
+        selNode = appLogic.GetSelectionNode()
+        selNode.SetReferenceActiveVolumeID(imageProxyVolumeNode.GetID())
+        appLogic.PropagateVolumeSelection()
+
+        # Show under the right patient/study in subject hierarchy
+        self.addSeriesInSubjectHierarchy(mVLoadable, imageProxyVolumeNode)
+
+        # Show sequence browser toolbar
+        sequencesModule = slicer.modules.sequences
+        if sequencesModule.autoShowToolBar:
+          sequencesModule.setToolBarActiveBrowserNode(sequenceBrowserNode)
+          sequencesModule.setToolBarVisible(True)
+        self.configureDisplayNode(imageProxyVolumeNode, loadable)
+      else:
+        # Finalize multi-volume import
+
+        mvDisplayNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMultiVolumeDisplayNode')
+        mvDisplayNode.SetDefaultColorMap()
+
+        mvNode.SetAndObserveDisplayNodeID(mvDisplayNode.GetID())
+        mvNode.SetAndObserveImageData(mvImage)
+        mvNode.SetNumberOfFrames(nFrames)
+        mvNode.SetName(mVLoadable.name)
+        slicer.mrmlScene.AddNode(mvNode)
+
+        # Show under the right patient/study in subject hierarchy
+        self.addSeriesInSubjectHierarchy(mVLoadable, mvNode)
+
+        #
+        # automatically select the volume to display
+        #
+        appLogic = slicer.app.applicationLogic()
+        selNode = appLogic.GetSelectionNode()
+        selNode.SetReferenceActiveVolumeID(mvNode.GetID())
+        appLogic.PropagateVolumeSelection()
+
+        # file list is no longer needed - remove the attribute
+        mvNode.RemoveAttribute('MultiVolume.FrameFileList')
+        self.configureDisplayNode(mvNode, loadable)
+
+
+    except Exception as e:
+      logging.error(f"Failed to read a multivolume: {str(e)}")
+      import traceback
+      traceback.print_exc()
+      mvNode = None
+
+    finally:
+      progressbar.close()
+
+    return mvNode
+
+
+  def configureDisplayNode(self, volumeNode, loadable):
+    appLogic = slicer.app.applicationLogic()
+    selNode = appLogic.GetSelectionNode()
+    displayNode = volumeNode.GetDisplayNode()
+    if displayNode is None:
+      return  # safety check
+
+    # Disable interpolation
+    displayNode.SetInterpolate(0)
+    if loadable.referencedModality == 'PT':
+      radiopharmaceuticalCode = ''
+      try:
+        radiopharmaceuticalCode = loadable.RadiopharmaceuticalCodeValue
+        volumeNode.SetAttribute('DICOM.RadiopharmaceuticalCodeValue',radiopharmaceuticalCode)
+        print('Found Radiopharmaceutical Code ' + radiopharmaceuticalCode)
+      except AttributeError:
+        volumeNode.SetAttribute('DICOM.RadiopharmaceuticalCodeValue','unknown')
+        # use radionuclide info instead
+        radionuclideCode = ''
+        try:
+          radionuclideCode = loadable.RadionuclideCodeValue
+          volumeNode.SetAttribute('DICOM.RadionuclideCodeValue',radionuclideCode)
+          print('Found Radionuclide Code ' + radionuclideCode)
+        except AttributeError:
+          volumeNode.SetAttribute('DICOM.RadionuclideCodeValue','unknown')
+      if radiopharmaceuticalCode == 'C-B1031': # FDG
+        displayNode.AutoWindowLevelOff()
+        displayNode.SetWindowLevel(6,3)
+        displayNode.SetAndObserveColorNodeID('vtkMRMLColorTableNodeInvertedGrey')
+      elif radiopharmaceuticalCode == 'C-B1036': # FLT
+        displayNode.AutoWindowLevelOff()
+        displayNode.SetWindowLevel(4,2)
+        displayNode.SetAndObserveColorNodeID('vtkMRMLColorTableNodeInvertedGrey')
+      else: # Default W/L if no info about radiopharmaceutical can be found, often FDG
+        displayNode.AutoWindowLevelOff()
+        displayNode.SetWindowLevel(6,3)
+        displayNode.SetAndObserveColorNodeID('vtkMRMLColorTableNodeInvertedGrey')
+    else:
+      displayNode.SetAutoWindowLevel(1)
+
+  def conversion(self, loadable, imageNode, conversionFactor, files):
+    # Create volume node
+    # imageNode = self.scalarVolumePlugin.loadFilesWithArchetype(loadable.files, loadable.name)
+    if imageNode:
+      # apply the conversion factor
+      multiplier = vtk.vtkImageMathematics()
+      multiplier.SetOperationToMultiplyByK()
+      multiplier.SetConstantK(float(conversionFactor))
+      multiplier.SetInput1Data(imageNode.GetImageData())
+      multiplier.Update()
+      imageNode.GetImageData().DeepCopy(multiplier.GetOutput())
+
+      # create list of DICOM instance UIDs corresponding to the loaded files
+      instanceUIDs = ""
+      for dicomFile in files:
+        uid = slicer.dicomDatabase.fileValue(dicomFile,self.tags['sopInstanceUID'])
+        if uid == "":
+          uid = "Unknown"
+        instanceUIDs += uid + " "
+      instanceUIDs = instanceUIDs[:-1]  # strip last space
+
+      # get the instance UID for the RWVM object
+      derivedItemUID = ""
+      try:
+        derivedItemUID = slicer.dicomDatabase.fileValue(loadable.rwvFile,self.tags['sopInstanceUID'])
+      except AttributeError:
+        # no derived items
+        pass
+
+      if loadable.quantity:
+        imageNode.SetVoxelValueQuantity(loadable.quantity)
+      if loadable.units:
+        imageNode.SetVoxelValueUnits(loadable.units)
+
+      # Keep references to the PET instances, as these may be needed to
+      # establish correspondence between slice annotations and acutal slices,
+      # but also keep the RWVM instance UID ... it's confusing, but not sure
+      # if there is a better way in Slicer for now
+      imageNode.SetAttribute("DICOM.instanceUIDs", instanceUIDs)
+      imageNode.SetAttribute("DICOM.RWV.instanceUID", derivedItemUID)
+
+      # # automatically select the volume to display
+      # volumeLogic = slicer.modules.volumes.logic()
+      # appLogic = slicer.app.applicationLogic()
+      # selNode = appLogic.GetSelectionNode()
+      # selNode.SetReferenceActiveVolumeID(imageNode.GetID())
+      # appLogic.PropagateVolumeSelection()
+      #
     return imageNode
 
 

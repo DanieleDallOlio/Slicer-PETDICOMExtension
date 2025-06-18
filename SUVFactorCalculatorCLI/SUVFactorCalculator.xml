@@ -4,10 +4,10 @@
   <title>SUV Factor Calculator</title>
   <description><![CDATA[Computes the standardized uptake value conversion factors based on body weight, lean body mass, body surface area, and ideal body weight. Takes an input path to a directory containing a PET volume (DICOM header must contain Radiopharmaceutical parameters).]]></description>
   <version>0.1.0</version>
-  <documentation-url>http://www.slicer.org/slicerWiki/index.php/Documentation/Nightly/Modules/SUVFactorCalculator</documentation-url>
+  <!-- <documentation-url>http://www.slicer.org/slicerWiki/index.php/Documentation/Nightly/Modules/SUVFactorCalculator</documentation-url> -->
   <license/>
-  <contributor>Andrey Fedorov (SPL), Ethan Ulrich (University of Iowa), Markus van Tol (University of Iowa), Christian Bauer (University of Iowa), Reinhard Beichel (University of Iowa), John Buatti (University of Iowa), Hans Johnson (University of Iowa), Wendy Plesniak (SPL, BWH), Nicole Aucoin (SPL, BWH), Ron Kikinis (SPL, BWH)</contributor>
-  <acknowledgements><![CDATA[This work is funded in part by Quantitative Imaging to Assess Response in Cancer Therapy Trials NIH grant U01-CA140206 and Quantitative Image Informatics for Cancer Research (QIICR) NIH grant U24 CA180918. ]]></acknowledgements>
+  <contributor>Daniele Dall'Olio (University of Bologna)</contributor>
+  <!-- <acknowledgements><![CDATA[This work is funded in part by Quantitative Imaging to Assess Response in Cancer Therapy Trials NIH grant U01-CA140206 and Quantitative Image Informatics for Cancer Research (QIICR) NIH grant U24 CA180918. ]]></acknowledgements> -->
   <parameters>
     <label>Input Image</label>
     <description><![CDATA[Input Image Data]]></description>
@@ -28,7 +28,138 @@
       <default></default>
     </string>
   </parameters>
-
+  <parameters>
+    <label> DICOM Tags information </label>
+    <description><![CDATA[Input DICOM Tags Data]]></description>
+    <string>
+      <name>RISTag</name>
+      <label>Radiopharmaceutical Information Sequence</label>
+      <channel>input</channel>
+      <longflag>--RIStag</longflag>
+      <description><![CDATA[Tag for Radiopharmaceutical Information Sequence]]></description>
+      <default>0054,0016</default>
+    </string>
+    <string>
+      <name>RIStimeTag</name>
+      <label>Radiopharmaceutical Start Time</label>
+      <channel>input</channel>
+      <longflag>--RIStimeTag</longflag>
+      <description><![CDATA[Tag for Radiopharmaceutical Start Time]]></description>
+      <default>0018,1072</default>
+    </string>
+    <string>
+      <name>RIStdoseTag</name>
+      <label>Radiopharmaceutical Total Dose</label>
+      <channel>input</channel>
+      <longflag>--RIStdoseTag</longflag>
+      <description><![CDATA[Tag for Radiopharmaceutical Total Dose]]></description>
+      <default>0018,1074</default>
+    </string>
+    <string>
+      <name>RIShalflifeTag</name>
+      <label>Radiopharmaceutical Half Life</label>
+      <channel>input</channel>
+      <longflag>--RIShalflifeTag</longflag>
+      <description><![CDATA[Tag for Radiopharmaceutical Half Life]]></description>
+      <default>0018,1075</default>
+    </string>
+    <string>
+      <name>RISposfracTag</name>
+      <label>Radiopharmaceutical Positron Fraction</label>
+      <channel>input</channel>
+      <longflag>--RISposfracTag</longflag>
+      <description><![CDATA[Tag for Radiopharmaceutical Positron Fraction]]></description>
+      <default>0018,1076</default>
+    </string>
+    <string>
+      <name>RISunitsTag</name>
+      <label>Radiopharmaceutical Units</label>
+      <channel>input</channel>
+      <longflag>--RISunitsTag</longflag>
+      <description><![CDATA[Tag for Radiopharmaceutical Units]]></description>
+      <default>0054,1001</default>
+    </string>
+    <string>
+      <name>decaycorrTag</name>
+      <label>Decay correction</label>
+      <channel>input</channel>
+      <longflag>--decaycorrTag</longflag>
+      <description><![CDATA[Tag for decay correction]]></description>
+      <default>0054,1102</default>
+    </string>
+    <string>
+      <name>StudyDateTag</name>
+      <label>Study Date</label>
+      <channel>input</channel>
+      <longflag>--StudyDateTag</longflag>
+      <description><![CDATA[Tag for Study Date]]></description>
+      <default>0008,0021</default>
+    </string>
+    <string>
+      <name>PatientNameTag</name>
+      <label>Patient Name</label>
+      <channel>input</channel>
+      <longflag>--PatientNameTag</longflag>
+      <description><![CDATA[Tag for Patient Name]]></description>
+      <default>0010,0010</default>
+    </string>
+    <string>
+      <name>DecayFactorTag</name>
+      <label>Decay Factor</label>
+      <channel>input</channel>
+      <longflag>--DecayFactorTag</longflag>
+      <description><![CDATA[Tag for Decay Factor]]></description>
+      <default>0054,1321</default>
+    </string>
+    <string>
+      <name>FrameReferenceTimeTag</name>
+      <label>Frame Reference Time</label>
+      <channel>input</channel>
+      <longflag>--FrameReferenceTimeTag</longflag>
+      <description><![CDATA[Tag for Frame Reference Time]]></description>
+      <default>0054,1300</default>
+    </string>
+    <string>
+      <name>SeriesTimeTag</name>
+      <label>Series Time</label>
+      <channel>input</channel>
+      <longflag>--SeriesTimeTag</longflag>
+      <description><![CDATA[Tag for Series Time]]></description>
+      <default>0008,0031</default>
+    </string>
+    <string>
+      <name>PatientWeightTag</name>
+      <label>Patient Weight</label>
+      <channel>input</channel>
+      <longflag>--PatientWeightTag</longflag>
+      <description><![CDATA[Tag for Patient Weight]]></description>
+      <default>0010,1030</default>
+    </string>
+    <string>
+      <name>PatientSizeTag</name>
+      <label>Patient Size</label>
+      <channel>input</channel>
+      <longflag>--PatientSizeTag</longflag>
+      <description><![CDATA[Tag for Patient Size]]></description>
+      <default>0010,1020</default>
+    </string>
+    <string>
+      <name>PatientSexTag</name>
+      <label>Patient Sex</label>
+      <channel>input</channel>
+      <longflag>--PatientSexTag</longflag>
+      <description><![CDATA[Tag for Patient Sex]]></description>
+      <default>0010,0040</default>
+    </string>
+    <string>
+      <name>CorrectedImageTag</name>
+      <label>Corrected Image</label>
+      <channel>input</channel>
+      <longflag>--CorrectedImageTag</longflag>
+      <description><![CDATA[Tag for Corrected Image]]></description>
+      <default>0028,0051</default>
+    </string>
+  </parameters>
   <parameters>
     <label>SUV Factor Information</label>
     <description><![CDATA[output]]></description>
@@ -115,6 +246,12 @@
       <label>Frame Reference Time</label>
       <channel>output</channel>
       <description><![CDATA[DICOM Tag (0054,1300) - Frame Reference Time]]></description>
+    </string>
+    <string>
+      <name>seriesdimension</name>
+      <label>Series Dimension</label>
+      <channel>output</channel>
+      <description><![CDATA[Series dimension]]></description>
     </string>
     <string>
       <name>SUVbwConversionFactor</name>

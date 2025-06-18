@@ -609,7 +609,7 @@ DCMTKFileReader
 {
   DcmTagKey tagkey(group,element);
   DcmElement *el;
-  if(this->m_Dataset->findAndGetElement(tagkey,el) != EC_Normal)
+  if(this->m_Dataset->findAndGetElement(tagkey,el, true) != EC_Normal)
     {
     DCMTKException(<< "Cant find tag " << std::hex
                    << group << " " << std::hex

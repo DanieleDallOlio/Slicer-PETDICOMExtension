@@ -109,6 +109,8 @@ class DICOMPETSUVPluginClass(DICOMPlugin):
             ptFile = pydicom.dcmread(fileList[0])
           else:
             ptFile = dicom.read_file(fileList[0])
+          self.multiframe = len(ptFile.pixel_array.shape) # This takes the value from the third <parameters> group from the xml and the second element
+          assert self.multiframe == 2 or self.multiframe == 3
           studyUID = slicer.dicomDatabase.fileValue(fileList[0],self.tags['studyInstanceUID'])
           for series in slicer.dicomDatabase.seriesForStudy(studyUID):
             if ptFile.SeriesInstanceUID != series:
@@ -168,7 +170,7 @@ class DICOMPETSUVPluginClass(DICOMPlugin):
     if SUVFactorCalculator.GetStatusString() != 'Completed':
       raise RuntimeError("SUVFactorCalculator CLI did not complete cleanly")
 
-    rwvFile = SUVFactorCalculator.GetParameterDefault(2,1)
+    rwvFile = SUVFactorCalculator.GetParameterDefault(3,1) # This takes the value from the third <parameters> group from the xml and the second element
 
     return rwvFile
 
@@ -202,7 +204,10 @@ class DICOMPETSUVPluginClass(DICOMPlugin):
     """Load the series into Slicer"""
 
     # Call the DICOMRWVMPlugin to get the image node
-    imageNode = self.rwvPlugin.loadPetSeries(loadable)
+    if self.multiframe==2:
+      imageNode = self.rwvPlugin.loadPetSeries(loadable)
+    else:
+      imageNode = self.rwvPlugin.loadPetMultiVolumeSeries(loadable)
     return imageNode
 
 
@@ -259,5 +264,3 @@ class DICOMPETSUVWidget:
 
   def exit(self):
     pass
-
-

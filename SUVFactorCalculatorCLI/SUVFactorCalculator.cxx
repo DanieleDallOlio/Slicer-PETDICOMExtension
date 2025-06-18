@@ -123,7 +123,44 @@ itk::ExposeMetaData<double>(*dictionary[i], "7053|1000", suv);
 namespace
 {
 
+static constexpr int ERROR_DCMTAG         = 1;
+
+void parseDICOMTag(const std::string& input, uint16_t& group, uint16_t& element, const std::string& label="") {
+  DcmTag tagobj;
+  OFCondition statustag;
+  statustag = tagobj.findTagFromName(input.c_str(), tagobj);
+  if (statustag.good()) {
+    group = tagobj.getGTag();
+    element = tagobj.getETag();
+  } else {
+    std::cerr << "Invalid tag for "<< label <<" from name: " << input << " ("
+          << statustag.text() << ")" << std::endl;
+    std :: exit(ERROR_DCMTAG);
+  }
+}
+
+struct tags
+  {
+    std::string RISTag;
+    std::string RIStimeTag;
+    std::string RIStdoseTag;
+    std::string RIShalflifeTag;
+    std::string RISposfracTag;
+    std::string RISunitsTag;
+    std::string decaycorrTag;
+    std::string StudyDateTag;
+    std::string PatientNameTag;
+    std::string DecayFactorTag;
+    std::string FrameReferenceTimeTag;
+    std::string SeriesTimeTag;
+    std::string PatientWeightTag;
+    std::string PatientSizeTag;
+    std::string PatientSexTag;
+    std::string CorrectedImageTag;
+};
+
 using OutputVolumeType = itk::Image<float, 3>;
+using OutputVolumeType4D = itk::Image<float, 4>;
 
 struct parameters
   {
@@ -157,6 +194,7 @@ struct parameters
 
     bool outputVolumeRequested;
     typename OutputVolumeType::Pointer unnormalizedVolume;
+    typename OutputVolumeType4D::Pointer unnormalizedVolume4d;
 
     std::vector< std::string > PETFilenames;
 
@@ -165,6 +203,9 @@ struct parameters
     std::string seriesDescription;
     std::string seriesNumber;
     std::string instanceNumber;
+
+    bool multiframe;
+    std::string seriesdimension;
 };
 
 // ...
@@ -199,7 +240,7 @@ bool WriteNormalizedImage(OutputVolumeType::Pointer image, std::string filename,
     normalize->SetShift(0.0);
     normalize->SetScale(normalizationFactor);
     normalize->SetInput(image);
-  
+
     using WriterType = itk::ImageFileWriter<OutputVolumeType>;
     auto writer = WriterType::New();
     writer->SetInput( normalize->GetOutput() );
@@ -212,6 +253,30 @@ bool WriteNormalizedImage(OutputVolumeType::Pointer image, std::string filename,
   }
   return true;
 }
+
+bool WriteNormalizedImage4d(OutputVolumeType4D::Pointer image, std::string filename, double normalizationFactor, bool useCompression=false)
+{
+  std::cout << "Writing normalized image " << filename << std::endl;
+  try {
+    using NormalizationFilterType = itk::ShiftScaleImageFilter<OutputVolumeType4D, OutputVolumeType4D> ;
+    auto normalize = NormalizationFilterType::New();
+    normalize->SetShift(0.0);
+    normalize->SetScale(normalizationFactor);
+    normalize->SetInput(image);
+
+    using WriterType = itk::ImageFileWriter<OutputVolumeType4D>;
+    auto writer = WriterType::New();
+    writer->SetInput( normalize->GetOutput() );
+    writer->SetFileName( filename );
+    writer->SetUseCompression(useCompression);
+    writer->Update();
+  } catch (itk::ExceptionObject &ex) {
+    std::cout << ex << std::endl;
+    return false;
+  }
+  return true;
+}
+
 
 // ...
 // ...............................................................................................
@@ -846,6 +911,755 @@ int LoadImagesAndComputeSUV( parameters & list )
 }
 
 
+bool IsMultiFrameDICOM(const std::string& filePath)
+{
+    itk::GDCMImageIO::Pointer dicomIO = itk::GDCMImageIO::New();
+    dicomIO->SetFileName(filePath);
+    dicomIO->ReadImageInformation();
+
+    const auto& dict = dicomIO->GetMetaDataDictionary();
+
+    std::string tag = "0028|0008"; // Number of Frames
+    if (dict.HasKey(tag)) {
+        std::string numFrames;
+        itk::ExposeMetaData<std::string>(dict, tag, numFrames);
+        std::cout << "Number of Frames: " << numFrames << std::endl;
+        return std::stoi(numFrames) > 1;
+    }
+
+    return false; // Single-frame (probably part of 2D slice series)
+}
+
+
+bool str2tag(const std::string& input, uint16_t& group, uint16_t& element) {
+    std::string cleaned;
+
+    // Remove parentheses if present
+    if (input.front() == '(' && input.back() == ')') {
+        cleaned = input.substr(1, input.size() - 2);
+    } else {
+        cleaned = input;
+    }
+
+    // Find the comma
+    size_t commaPos = cleaned.find(',');
+    if (commaPos == std::string::npos || commaPos == 0 || commaPos == cleaned.size() - 1) {
+        return false;
+    }
+
+    // Extract substrings
+    std::string groupStr = cleaned.substr(0, commaPos);
+    std::string elementStr = cleaned.substr(commaPos + 1);
+
+    // Convert hex strings to uint16_t
+    std::istringstream groupStream(groupStr);
+    std::istringstream elementStream(elementStr);
+
+    groupStream >> std::hex >> group;
+    elementStream >> std::hex >> element;
+
+    // Check for conversion errors
+    return !groupStream.fail() && !elementStream.fail();
+}
+
+int LoadImagesAndComputeSUV( parameters & list, tags & taglist)
+{
+  typedef itk::GDCMSeriesFileNames InputNamesGeneratorType;
+
+  if ( !list.PETDICOMPath.compare(""))
+    {
+    std::cerr << "GetParametersFromDicomHeader:Got empty list.PETDICOMPath." << std::endl;
+    return EXIT_FAILURE;
+    }
+
+  //--- catch non-dicom data
+  vtkGlobFileNames* gfn = vtkGlobFileNames::New();
+  gfn->SetDirectory(list.PETDICOMPath.c_str());
+  gfn->AddFileNames("*.nhdr");
+  gfn->AddFileNames("*.nrrd");
+  gfn->AddFileNames("*.hdr");
+  gfn->AddFileNames("*.mha");
+  gfn->AddFileNames("*.img");
+  gfn->AddFileNames("*.nii");
+  gfn->AddFileNames("*.nia");
+
+  int notDICOM = 0;
+  int nFiles = gfn->GetNumberOfFileNames();
+  if (nFiles > 0)
+    {
+    notDICOM = 1;
+    }
+  gfn->Delete();
+  if ( notDICOM )
+    {
+    std::cerr << "PET Dicom parameter doesn't point to a dicom directory!" << std::endl;
+    return EXIT_FAILURE;
+    }
+
+  InputNamesGeneratorType::Pointer inputNames = InputNamesGeneratorType::New();
+  inputNames->SetUseSeriesDetails(false); // Series details not necessary to distinguish between different PET scans
+  inputNames->SetDirectory(list.PETDICOMPath);
+  itk::SerieUIDContainer seriesUIDs = inputNames->GetSeriesUIDs();
+  std::string selectedSeriesUID = list.PETSeriesInstanceUID.length()>0 ? list.PETSeriesInstanceUID : seriesUIDs[0];
+  if (std::find(seriesUIDs.begin(), seriesUIDs.end(), selectedSeriesUID) == seriesUIDs.end())
+  {
+    std::cerr << "Selected series instance UID not found in PET dicom path!" << std::endl;
+    return EXIT_FAILURE;
+  }
+  std::vector<std::string> fns = inputNames->GetFileNames(selectedSeriesUID);
+  list.PETFilenames = inputNames->GetFileNames(selectedSeriesUID);
+
+  std::string FirstFile = fns[0];
+  bool multiframe = IsMultiFrameDICOM(FirstFile);
+  list.multiframe = multiframe;
+  list.seriesdimension = multiframe? "4D" : "3D";
+
+  typedef short PixelValueType;
+  if (multiframe) {
+    typedef itk::Image< PixelValueType, 4 > VolumeType;
+    typedef itk::ImageSeriesReader< VolumeType > VolumeReaderType;
+    itk::GDCMImageIO::Pointer dicomIO = itk::GDCMImageIO::New();
+    const VolumeReaderType::FileNamesContainer & filenames = inputNames->GetFileNames(selectedSeriesUID);
+    VolumeReaderType::Pointer volumeReader = VolumeReaderType::New();
+    volumeReader->SetImageIO( dicomIO );
+    volumeReader->SetFileNames( filenames );
+    try{
+        volumeReader->Update();
+      }
+        catch (itk::ExceptionObject &ex)
+      {
+        std::cout << ex << std::endl;
+        return EXIT_FAILURE;
+      }
+
+    // Determine largest value
+    using MinMaxCalculatorType = itk::MinimumMaximumImageCalculator<VolumeType>;
+    auto calc = MinMaxCalculatorType::New();
+    calc->SetImage(volumeReader->GetOutput());
+    calc->Compute();
+    list.maxPixelValue = calc->GetMaximum();
+
+    if (list.outputVolumeRequested){ // read image with precision of output volume
+        auto reader = itk::ImageSeriesReader< OutputVolumeType4D >::New();
+        reader->SetImageIO( dicomIO );
+        reader->SetFileNames( filenames );
+        reader->Update();
+        list.unnormalizedVolume4d = reader->GetOutput();
+    }
+
+
+  } else {
+    typedef itk::Image< PixelValueType, 3 > VolumeType;
+    typedef itk::ImageSeriesReader< VolumeType > VolumeReaderType;
+    itk::GDCMImageIO::Pointer dicomIO = itk::GDCMImageIO::New();
+    const VolumeReaderType::FileNamesContainer & filenames = inputNames->GetFileNames(selectedSeriesUID);
+    VolumeReaderType::Pointer volumeReader = VolumeReaderType::New();
+    volumeReader->SetImageIO( dicomIO );
+    volumeReader->SetFileNames( filenames );
+    try{
+        volumeReader->Update();
+      }
+        catch (itk::ExceptionObject &ex)
+      {
+        std::cout << ex << std::endl;
+        return EXIT_FAILURE;
+      }
+
+
+    // Determine largest value
+    using MinMaxCalculatorType = itk::MinimumMaximumImageCalculator<VolumeType>;
+    auto calc = MinMaxCalculatorType::New();
+    calc->SetImage(volumeReader->GetOutput());
+    calc->Compute();
+    list.maxPixelValue = calc->GetMaximum();
+
+    if (list.outputVolumeRequested){ // read image with precision of output volume
+        auto reader = itk::ImageSeriesReader< OutputVolumeType >::New();
+        reader->SetImageIO( dicomIO );
+        reader->SetFileNames( filenames );
+        reader->Update();
+        list.unnormalizedVolume = reader->GetOutput();
+    }
+
+  }
+
+  std::string tag;
+  std::string yearstr;
+  std::string monthstr;
+  std::string daystr;
+  std::string hourstr;
+  std::string minutestr;
+  std::string secondstr;
+  int len;
+
+// Nuclear Medicine DICOM info:
+/*
+    0054,0016  Radiopharmaceutical Information Sequence:
+    0018,1072  Radionuclide Start Time: 090748.000000
+    0018,1074  Radionuclide Total Dose: 370500000
+    0018,1075  Radionuclide Half Life: 6586.2
+    0018,1076  Radionuclide Positron Fraction: 0
+*/
+  int parsingDICOM = 0;
+  itk::DCMTKFileReader fileReader;
+  fileReader.SetFileName(FirstFile);
+  fileReader.LoadFile();
+
+  uint16_t grouptag, elementtag;
+  DcmFileFormat fileFormat;
+  DcmDataset* petDataset = NULL;
+  if(fileFormat.loadFile(FirstFile.c_str()).bad()){
+    std::cerr << "Cannot read metadata!" << std::endl;
+    return EXIT_FAILURE;
+  }
+  petDataset = fileFormat.getAndRemoveDataset();
+  std :: string tagvalue;
+
+  parseDICOMTag(taglist.RISTag, grouptag, elementtag, "Radiopharmaceutical Information Sequence");
+
+  itk::DCMTKSequence seq;
+  if(fileReader.GetElementSQ(grouptag,elementtag,seq,false) == EXIT_SUCCESS)
+    {
+      parsingDICOM = 1;
+          //---
+          //--- Radiopharmaceutical Start Time
+
+      parseDICOMTag(taglist.RIStimeTag, grouptag, elementtag, "Radionuclide Start Time");
+
+      seq.GetElementTM(grouptag,elementtag,tag);
+          //--- expect A string of characters of the format hhmmss.frac;
+          //---where hh contains hours (range "00" - "23"), mm contains minutes
+          //---(range "00" - "59"), ss contains seconds (range "00" - "59"), and frac
+          //---contains a fractional part of a second as small as 1 millionth of a
+          //---second (range "000000" - "999999"). A 24 hour clock is assumed.
+          //---Midnight can be represented by only "0000" since "2400" would
+          //---violate the hour range. The string may be padded with trailing
+          //---spaces. Leading and embedded spaces are not allowed. One
+          //---or more of the components mm, ss, or frac may be unspecified
+          //---as long as every component to the right of an unspecified
+          //---component is also unspecified. If frac is unspecified the preceding "."
+          //---may not be included. Frac shall be held to six decimal places or
+          //---less to ensure its format conforms to the ANSI
+          //---Examples -
+          //---1. "070907.0705" represents a time of 7 hours, 9 minutes and 7.0705 seconds.
+          //---2. "1010" represents a time of 10 hours, and 10 minutes.
+          //---3. "021" is an invalid value.
+      if ( tag.c_str() == NULL || *(tag.c_str()) == '\0' )
+        {
+          list.injectionTime  = "MODULE_INIT_NO_VALUE" ;
+        }
+      else
+        {
+          len = tag.length();
+          hourstr.clear();
+          minutestr.clear();
+          secondstr.clear();
+          if ( len >= 2 )
+            {
+              hourstr = tag.substr(0, 2);
+            }
+          else
+            {
+              hourstr = "00";
+            }
+          if ( len >= 4 )
+            {
+              minutestr = tag.substr(2, 2);
+            }
+          else
+            {
+              minutestr = "00";
+            }
+          if ( len >= 6 )
+            {
+              secondstr = tag.substr(4);
+            }
+          else
+            {
+              secondstr = "00";
+            }
+          tag.clear();
+          tag = hourstr.c_str();
+          tag += ":";
+          tag += minutestr.c_str();
+          tag += ":";
+          tag += secondstr.c_str();
+          list.injectionTime = tag.c_str();
+        }
+
+        //---
+        //--- Radionuclide Total Dose
+      parseDICOMTag(taglist.RIStdoseTag, grouptag, elementtag, "Radionuclide Total Dose");
+      if(seq.GetElementDS(grouptag,elementtag,1,&list.injectedDose,false) != EXIT_SUCCESS)
+        {
+          list.injectedDose = 0.0;
+        }
+
+          //---
+          //--- RadionuclideHalfLife
+          //--- Expect a Decimal String
+          //--- A string of characters representing either
+          //--- a fixed point number or a floating point number.
+          //--- A fixed point number shall contain only the characters 0-9
+          //--- with an optional leading "+" or "-" and an optional "." to mark
+          //--- the decimal point. A floating point number shall be conveyed
+          //--- as defined in ANSI X3.9, with an "E" or "e" to indicate the start
+          //--- of the exponent. Decimal Strings may be padded with leading
+          //--- or trailing spaces. Embedded spaces are not allowed.
+      parseDICOMTag(taglist.RIShalflifeTag, grouptag, elementtag, "Radionuclide Half Life");
+      if(seq.GetElementDS(grouptag,elementtag,list.radionuclideHalfLife,false) != EXIT_SUCCESS)
+        {
+          list.radionuclideHalfLife = "MODULE_INIT_NO_VALUE";
+        }
+          //---
+          //---Radionuclide Positron Fraction
+          //--- not currently using this one?
+      std::string radioNuclidePositronFraction;
+      parseDICOMTag(taglist.RISposfracTag, grouptag, elementtag, "Radionuclide Positron Fraction");
+      if(seq.GetElementDS(grouptag,elementtag,radioNuclidePositronFraction,false) != EXIT_SUCCESS)
+        {
+          radioNuclidePositronFraction = "MODULE_INIT_NO_VALUE";
+        }
+
+        //--
+        //--- UNITS: something like BQML:
+        //--- CNTS, NONE, CM2, PCNT, CPS, BQML,
+        //--- MGMINML, UMOLMINML, MLMING, MLG,
+        //--- 1CM, UMOLML, PROPCNTS, PROPCPS,
+        //--- MLMINML, MLML, GML, STDDEV
+        //---
+      parseDICOMTag(taglist.RISunitsTag, grouptag, elementtag, "Units");
+      if(fileReader.GetElementCS(grouptag,elementtag,tag,false) == EXIT_SUCCESS)
+        {
+          //--- I think these are piled together. MBq ml... search for all.
+          std::string units = tag.c_str();
+          if ( ( units.find ("BQML") != std::string::npos) ||
+               ( units.find ("BQML") != std::string::npos) )
+            {
+              list.radioactivityUnits= "Bq";
+            }
+          else if ( ( units.find ("MBq") != std::string::npos) ||
+                    ( units.find ("MBQ") != std::string::npos) )
+            {
+              list.radioactivityUnits = "MBq";
+            }
+          else if ( (units.find ("kBq") != std::string::npos) ||
+                    (units.find ("kBQ") != std::string::npos) ||
+                    (units.find ("KBQ") != std::string::npos) )
+            {
+              list.radioactivityUnits = "kBq";
+            }
+          else if ( (units.find ("mBq") != std::string::npos) ||
+                    (units.find ("mBQ") != std::string::npos) )
+            {
+              list.radioactivityUnits = "mBq";
+            }
+          else if ( (units.find ("uBq") != std::string::npos) ||
+                    (units.find ("uBQ") != std::string::npos) )
+            {
+              list.radioactivityUnits = "uBq";
+            }
+          else if ( (units.find ("Bq") != std::string::npos) ||
+                    (units.find ("BQ") != std::string::npos) )
+            {
+              list.radioactivityUnits = "Bq";
+            }
+          else if ( (units.find ("MCi") != std::string::npos) ||
+                    ( units.find ("MCI") != std::string::npos) )
+            {
+              list.radioactivityUnits = "MCi";
+            }
+          else if ( (units.find ("kCi") != std::string::npos) ||
+                    (units.find ("kCI") != std::string::npos)  ||
+                    (units.find ("KCI") != std::string::npos) )
+            {
+              list.radioactivityUnits = "kCi";
+            }
+          else if ( (units.find ("mCi") != std::string::npos) ||
+                    (units.find ("mCI") != std::string::npos) )
+            {
+              list.radioactivityUnits = "mCi";
+            }
+          else if ( (units.find ("uCi") != std::string::npos) ||
+                    (units.find ("uCI") != std::string::npos) )
+            {
+              list.radioactivityUnits = "uCi";
+            }
+          else if ( (units.find ("Ci") != std::string::npos) ||
+                    (units.find ("CI") != std::string::npos) )
+            {
+              list.radioactivityUnits = "Ci";
+            }
+            list.volumeUnits = "ml";
+          }
+      else
+        {
+        //--- default values.
+          list.radioactivityUnits = "MBq";
+          list.volumeUnits = "ml";
+        }
+
+
+        //---
+        //--- DecayCorrection
+        //--- Possible values are:
+        //--- NONE = no decay correction
+        //--- START= acquisition start time
+        //--- ADMIN = radiopharmaceutical administration time
+        //--- Frame Reference Time  is the time that the pixel values in the Image occurred.
+        //--- It's defined as the time offset, in msec, from the Series Reference Time.
+        //--- Series Reference Time is defined by the combination of:
+        //--- Series Date (0008,0021) and
+        //--- Series Time (0008,0031).
+        //--- We don't pull these out now, but can if we have to.
+      parseDICOMTag(taglist.decaycorrTag, grouptag, elementtag, "Decay Correction");
+      if(fileReader.GetElementCS(grouptag,elementtag,tag,false) == EXIT_SUCCESS)
+        {
+          //---A string of characters with leading or trailing spaces (20H) being non-significant.
+          list.decayCorrection = tag.c_str();
+        }
+      else
+        {
+          list.decayCorrection = "MODULE_INIT_NO_VALUE";
+        }
+
+      //---
+      //--- StudyDate
+      parseDICOMTag(taglist.StudyDateTag, grouptag, elementtag, "Study Date");
+      if(fileReader.GetElementDA(grouptag,elementtag,tag,false) == EXIT_SUCCESS)
+        {
+          //--- YYYYMMDD
+          yearstr.clear();
+          daystr.clear();
+          monthstr.clear();
+          len = tag.length();
+          if ( len >= 4 )
+            {
+              yearstr = tag.substr(0, 4);
+            }
+          else
+            {
+              yearstr = "????";
+            }
+          if ( len >= 6 )
+            {
+              monthstr = tag.substr(4, 2);
+            }
+          else
+            {
+              monthstr = "??";
+            }
+          if ( len >= 8 )
+            {
+              daystr = tag.substr (6, 2);
+            }
+          else
+            {
+              daystr = "??";
+            }
+          tag.clear();
+          tag = yearstr.c_str();
+          tag += "/";
+          tag += monthstr.c_str();
+          tag += "/";
+          tag += daystr.c_str();
+          list.studyDate = tag.c_str();
+        }
+      else
+        {
+          list.studyDate = "MODULE_INIT_NO_VALUE";
+        }
+
+      //---
+      //--- PatientName
+      parseDICOMTag(taglist.PatientNameTag, grouptag, elementtag, "Patient Name");
+      if(fileReader.GetElementPN(grouptag,elementtag,tag,false) == EXIT_SUCCESS)
+        {
+          list.patientName = tag.c_str();
+        }
+      else
+        {
+          list.patientName = "MODULE_INIT_NO_VALUE";
+        }
+
+      //---
+      //--- DecayFactor
+      parseDICOMTag(taglist.DecayFactorTag, grouptag, elementtag, "Decay Factor");
+      if(fileReader.GetElementDS(grouptag,elementtag,tag,false) == EXIT_SUCCESS)
+        {
+          //--- have to parse this out. what we have is
+          //---A string of characters representing either a fixed point number or a
+          //--- floating point number. A fixed point number shall contain only the
+          //---characters 0-9 with an optional leading "+" or "-" and an optional "."
+          //---to mark the decimal point. A floating point number shall be conveyed
+          //---as defined in ANSI X3.9, with an "E" or "e" to indicate the start of the
+          //---exponent. Decimal Strings may be padded with leading or trailing spaces.
+          //---Embedded spaces are not allowed. or maybe atof does it already...
+          list.decayFactor =  tag.c_str() ;
+        }
+      else
+        {
+          list.decayFactor =  "MODULE_INIT_NO_VALUE" ;
+        }
+
+
+      //---
+      //--- FrameReferenceTime
+      parseDICOMTag(taglist.FrameReferenceTimeTag, grouptag, elementtag, "Frame Reference Time");
+      if(fileReader.GetElementDS(grouptag,elementtag,tag,false) == EXIT_SUCCESS)
+        {
+          //--- The time that the pixel values in the image
+          //--- occurred. Frame Reference Time is the
+          //--- offset, in msec, from the Series reference
+          //--- time.
+          list.frameReferenceTime = tag.c_str();
+        }
+      else
+        {
+          list.frameReferenceTime = "MODULE_INIT_NO_VALUE";
+        }
+
+
+      //---
+      //--- SeriesTime
+      parseDICOMTag(taglist.SeriesTimeTag, grouptag, elementtag, "Series Time");
+      if(fileReader.GetElementTM(grouptag,elementtag,tag,false) == EXIT_SUCCESS)
+        {
+          hourstr.clear();
+          minutestr.clear();
+          secondstr.clear();
+          len = tag.length();
+          if ( len >= 2 )
+            {
+              hourstr = tag.substr(0, 2);
+            }
+          else
+            {
+              hourstr = "00";
+            }
+          if ( len >= 4 )
+            {
+              minutestr = tag.substr(2, 2);
+            }
+          else
+            {
+              minutestr = "00";
+            }
+          if ( len >= 6 )
+            {
+              secondstr = tag.substr(4);
+            }
+          else
+            {
+              secondstr = "00";
+            }
+          tag.clear();
+          tag = hourstr.c_str();
+          tag += ":";
+          tag += minutestr.c_str();
+          tag += ":";
+          tag += secondstr.c_str();
+          list.seriesReferenceTime = tag.c_str();
+        }
+      else
+        {
+          list.seriesReferenceTime = "MODULE_INIT_NO_VALUE";
+        }
+
+
+      //---
+      //--- PatientWeight
+      parseDICOMTag(taglist.PatientWeightTag, grouptag, elementtag, "Patient Weight");
+      if(fileReader.GetElementDS(grouptag,elementtag,1,&list.patientWeight,false) == EXIT_SUCCESS)
+        {
+          //--- Expect same format as RadionuclideHalfLife
+          list.weightUnits = "kg";
+        }
+      else
+        {
+          list.patientWeight = 0.0;
+          list.weightUnits = "";
+        }
+
+      //---
+      //--- PatientSize
+      parseDICOMTag(taglist.PatientSizeTag, grouptag, elementtag, "Patient Size");
+      if(fileReader.GetElementDS(grouptag,elementtag,1,&list.patientHeight,false) == EXIT_SUCCESS)
+        {
+          //--- Assumed to be in meters?
+          list.heightUnits = "m";
+        }
+      else
+        {
+          list.patientHeight = 0.0;
+          list.heightUnits = "MODULE_INIT_NO_VALUE";
+        }
+
+      //---
+      //--- PatientSex
+      parseDICOMTag(taglist.PatientSexTag, grouptag, elementtag, "Patient Sex");
+      if(fileReader.GetElementCS(grouptag,elementtag,tag,false) == EXIT_SUCCESS)
+        {
+          list.patientSex = tag.c_str();
+          if(list.patientSex!="M" && list.patientSex!="F")
+            {
+              std::cout << "Warning: sex is not M or F but rather \"" << list.patientSex.c_str() << "\"" << std::endl;
+            }
+        }
+      else
+        {
+          list.patientSex = "MODULE_INIT_NO_VALUE";
+        }
+
+      //---
+      //--- CorrectedImage
+      std::string correctedImage;
+      parseDICOMTag(taglist.CorrectedImageTag, grouptag, elementtag, "Corrected Image");
+      if(fileReader.GetElementCS(grouptag,elementtag,correctedImage,false) == EXIT_SUCCESS)
+        {
+          list.correctedImage = correctedImage;
+        }
+      else
+        {
+          std::cout << "No corrected image detected." << std::endl;
+        }
+
+      /*//---
+      //--- CalibrationFactor
+      if(fileReader.GetElementDS(0x7053,0x1009,1,
+                                   &list.calibrationFactor,false) != EXIT_SUCCESS)
+        {
+          list.calibrationFactor =  0.0 ;
+        }*/
+    }
+
+  // check.... did we get all params we need for computation?
+  if ( (parsingDICOM) &&
+       (list.injectedDose != 0.0) &&
+       (list.patientWeight != 0.0) &&
+       (list.seriesReferenceTime.compare("MODULE_INIT_NO_VALUE") != 0) &&
+       (list.injectionTime.compare("MODULE_INIT_NO_VALUE") != 0) &&
+       (list.radionuclideHalfLife.compare("MODULE_INIT_NO_VALUE") != 0) )
+    {
+      std::cout << "Input parameters okay..." << std::endl;
+    }
+  else
+    {
+      std::cerr << "Missing some parameters..." << std::endl;
+      return EXIT_FAILURE;
+    }
+
+  // convert from input units.
+  if( list.radioactivityUnits.c_str() == NULL )
+    {
+      std::cerr << "ComputeSUV: Got NULL radioactivity units. No computation done." << std::endl;
+      return EXIT_FAILURE;
+    }
+  if( list.weightUnits.c_str() == NULL )
+    {
+      std::cerr << "ComputeSUV: Got NULL weight units. No computation could be done." << std::endl;
+      return EXIT_FAILURE;
+    }
+
+
+  list.SUVbwConversionFactor = 0.0;
+  list.SUVlbmConversionFactor = 0.0;
+  list.SUVbsaConversionFactor = 0.0;
+  list.SUVibwConversionFactor = 0.0;
+  if(list.correctedImage.compare("MODULE_INIT_NO_VALUE") != 0)
+    {
+      std::string correctedImage = list.correctedImage;
+      if(correctedImage.find("ATTN")!=std::string::npos &&
+         (correctedImage.find("DECAY")!=std::string::npos || correctedImage.find("DECY")!=std::string::npos))
+        {
+          std::cout << "ATTN/DECAY correction detected." << std::endl;
+          if(list.decayCorrection=="START")
+            {
+              std::cout << "Decay correction START detected." << std::endl;
+              std::string halfLife = list.radionuclideHalfLife;
+              double weight = list.patientWeight;
+              double height = list.patientHeight*100; //convert to centimeters
+              double dose = list.injectedDose;
+         std::cout << "                  INJECTED DOSE: " << list.injectedDose << std::endl;
+              if( dose == 0.0 )
+                {
+                  std::cerr << "ComputeSUV: Got NULL dose!" << std::endl;
+                  return EXIT_FAILURE;
+                }
+              if( weight == 0.0 )
+                {
+                  std::cerr << "ComputeSUV: got zero weight!" << std::endl;
+                  return EXIT_FAILURE;
+                }
+              dose  = ConvertRadioactivityUnits( dose, list.radioactivityUnits.c_str(), "kBq");  // kBq/mL
+              double decayedDose = DecayCorrection(list, dose);
+              weight = ConvertWeightUnits( weight, list.weightUnits.c_str(), "kg");
+              if( decayedDose == 0.0 )
+                {
+                  // oops, weight by dose is infinity. give error
+                  std::cerr << "ComputeSUV: Got 0.0 decayed dose!" << std::endl;
+                  return EXIT_FAILURE;
+                }
+              else
+                { //All values okay; perform calculation
+                  list.SUVbwConversionFactor = weight / decayedDose;
+                  if(height != 0.0)
+                    {
+                      double leanBodyMass;    // kg
+                      double bodySurfaceArea; // m^2
+                      double idealBodyMass;   // kg
+
+                      bodySurfaceArea = (pow(weight,0.425)*pow(height,0.725)*0.007184);
+                      list.SUVbsaConversionFactor = bodySurfaceArea / decayedDose;
+                      if(list.patientSex=="M")
+                        {
+                          //leanBodyMass = 1.10*weight - 120*(weight/height)*(weight/height);
+                          leanBodyMass = 1.10*weight - 128*(weight/height)*(weight/height);  //TODO verify this formula
+                          list.SUVlbmConversionFactor = leanBodyMass / decayedDose;
+
+                          idealBodyMass = 48.0 + 1.06*(height - 152);
+                          if(idealBodyMass > weight){ idealBodyMass = weight; };
+                          list.SUVibwConversionFactor = idealBodyMass / decayedDose;
+                        }
+                      if(list.patientSex=="F")
+                        {
+                          leanBodyMass = 1.07*weight - 148*(weight/height)*(weight/height);
+                          list.SUVlbmConversionFactor = leanBodyMass / decayedDose;
+
+                          idealBodyMass = 45.5 + 0.91*(height - 152);
+                          if(idealBodyMass > weight){ idealBodyMass = weight; };
+                          list.SUVibwConversionFactor = idealBodyMass / decayedDose;
+                        }
+                    }
+                  else
+                    {
+                      std::cout << "Warning: No patient height detected.  Cannot determine SUVbsa, SUVlbm, and SUVibw conversion factors." << std::endl;
+                    }
+                }
+            }
+          else
+            {
+              std::cout << "Decay correction is not START." << std::endl;
+              return EXIT_FAILURE;
+            }
+        }
+      else
+        {
+          std::cout << "No attenuation/decay correction detected." << std::endl;
+          return EXIT_FAILURE;
+        }
+    }
+  else
+    {
+      std::cout << "No corrected image detected." << std::endl;
+      return EXIT_FAILURE;
+    }
+
+  return EXIT_SUCCESS;
+
+}
+
+
 } // end of anonymous namespace
 
 void InsertCodeSequence(DcmItem* item, const DcmTag tag, const DSRCodedEntryValue entry, int itemNum=0){
@@ -1003,6 +1817,11 @@ bool ExportRWV(parameters & list,
   rwvDataset->putAndInsertString(DCM_ContentCreatorName, "QIICR");
   rwvDataset->putAndInsertString(DCM_Manufacturer, "https://github.com/QIICR/Slicer-SUVFactorCalculator");
   rwvDataset->putAndInsertString(DCM_SoftwareVersions, SUVFactorCalculator_WC_REVISION);
+  DcmItem *formatDcm;
+  rwvDataset->findOrCreateSequenceItem(DcmTag(0x0040,0x9225), formatDcm);
+  formatDcm->putAndInsertString(DCM_CodeValue, list.seriesdimension.c_str());
+  formatDcm->putAndInsertString(DCM_CodeMeaning, "Series Dimension");
+  formatDcm->putAndInsertString(DCM_CodingSchemeDesignator, "Series Dimension (3D or 4D)");
   //CHECK_COND(rwvDataset->putAndInsertString(DCM_BodyPartExamined, "HEADNECK"));
 
   if (outputFileName.empty())
@@ -1025,10 +1844,11 @@ int main( int argc, char * argv[] )
 {
   PARSE_ARGS;
   parameters list;
-
-  // ...
-  // ... strings used for parsing out DICOM header info
-  // ...
+  tags taglist;
+  //
+  // // ...
+  // // ... strings used for parsing out DICOM header info
+  // // ...
   std::string yearstr;
   std::string monthstr;
   std::string daystr;
@@ -1036,8 +1856,8 @@ int main( int argc, char * argv[] )
   std::string minutestr;
   std::string secondstr;
   std::string tag;
-
-  // convert dicom head to radiopharm data vars
+  //
+  // // convert dicom head to radiopharm data vars
   list.patientName = "MODULE_INIT_NO_VALUE";
   list.studyDate = "MODULE_INIT_NO_VALUE";
   list.radioactivityUnits = "MODULE_INIT_NO_VALUE";
@@ -1055,10 +1875,28 @@ int main( int argc, char * argv[] )
   list.weightUnits = "kg";
   list.correctedImage = "MODULE_INIT_NO_VALUE";
   list.maxPixelValue = itk::NumericTraits< short >::min();
+  list.seriesdimension = "";
   list.outputVolumeRequested = (SUVBWName!="" || SUVBSAName!="" || SUVLBMName!="" || SUVIBWName!="");
 
   try
     {
+    taglist.RISTag = RISTag;
+    taglist.RIStimeTag = RIStimeTag;
+    taglist.RIStdoseTag = RIStdoseTag;
+    taglist.RIShalflifeTag = RIShalflifeTag;
+    taglist.RISposfracTag = RISposfracTag;
+    taglist.RISunitsTag = RISunitsTag;
+    taglist.decaycorrTag = decaycorrTag;
+    taglist.StudyDateTag = StudyDateTag;
+    taglist.PatientNameTag = PatientNameTag;
+    taglist.DecayFactorTag = DecayFactorTag;
+    taglist.FrameReferenceTimeTag = FrameReferenceTimeTag;
+    taglist.SeriesTimeTag = SeriesTimeTag;
+    taglist.PatientWeightTag = PatientWeightTag;
+    taglist.PatientSizeTag = PatientSizeTag;
+    taglist.PatientSexTag = PatientSexTag;
+    taglist.CorrectedImageTag = CorrectedImageTag;
+
     // pass the input parameters to the helper method
     list.PETDICOMPath = PETDICOMPath;
     list.PETSeriesInstanceUID = PETSeriesInstanceUID;
@@ -1069,7 +1907,7 @@ int main( int argc, char * argv[] )
     // returnParameterFile, write the output strings in there as key = value pairs
     list.returnParameterFile = returnParameterFile;
 
-    if(LoadImagesAndComputeSUV( list ) != EXIT_FAILURE){
+    if(LoadImagesAndComputeSUV( list, taglist ) != EXIT_FAILURE){
 
       if (RWVDICOMPath!="" || RWVMFile!="")
       {
@@ -1106,7 +1944,7 @@ int main( int argc, char * argv[] )
 
         ExportRWV(list, measurementsUnitsList, measurementsList, RWVDICOMPath.c_str(), RWVMFile);
       }
-      
+
       if (list.outputVolumeRequested)
       {
         // write SUV normalized volume(s)
@@ -1114,29 +1952,46 @@ int main( int argc, char * argv[] )
         {
           if (list.SUVbwConversionFactor==0.0)
             std::cerr << "WARNING: Can't compute SUV body weight and produce normalized volume." << std::endl;
-          else
-            WriteNormalizedImage(list.unnormalizedVolume, SUVBWName, list.SUVbwConversionFactor);
+          else {
+            if (list.multiframe)
+              WriteNormalizedImage4d(list.unnormalizedVolume4d, SUVBWName, list.SUVbwConversionFactor);
+            else
+              WriteNormalizedImage(list.unnormalizedVolume, SUVBWName, list.SUVbwConversionFactor);
+
+          }
         }
         if (SUVLBMName!="")
         {
           if (list.SUVlbmConversionFactor==0.0)
             std::cerr << "WARNING: Can't compute SUV lean body mass and produce normalized volume." << std::endl;
-          else
-            WriteNormalizedImage(list.unnormalizedVolume, SUVLBMName, list.SUVlbmConversionFactor);
+          else {
+            if (list.multiframe)
+              WriteNormalizedImage4d(list.unnormalizedVolume4d, SUVLBMName, list.SUVbwConversionFactor);
+            else
+              WriteNormalizedImage(list.unnormalizedVolume, SUVLBMName, list.SUVlbmConversionFactor);
+          }
         }
         if (SUVBSAName!="")
         {
           if (list.SUVbsaConversionFactor==0.0)
             std::cerr << "WARNING: Can't compute SUV body surface area and produce normalized volume." << std::endl;
-          else
-            WriteNormalizedImage(list.unnormalizedVolume, SUVBSAName, list.SUVbsaConversionFactor);
+          else {
+            if (list.multiframe)
+              WriteNormalizedImage4d(list.unnormalizedVolume4d, SUVBSAName, list.SUVbwConversionFactor);
+            else
+              WriteNormalizedImage(list.unnormalizedVolume, SUVBSAName, list.SUVlbmConversionFactor);
+          }
         }
         if (SUVIBWName!="")
         {
           if (list.SUVibwConversionFactor==0.0)
             std::cerr << "WARNING: Can't compute SUV ideal body weight and produce normalized volume." << std::endl;
-          else
-            WriteNormalizedImage(list.unnormalizedVolume, SUVIBWName, list.SUVibwConversionFactor);
+          else {
+            if (list.multiframe)
+              WriteNormalizedImage4d(list.unnormalizedVolume4d, SUVIBWName, list.SUVbwConversionFactor);
+            else
+              WriteNormalizedImage(list.unnormalizedVolume, SUVIBWName, list.SUVlbmConversionFactor);
+          }
         }
       }
 
@@ -1161,6 +2016,7 @@ int main( int argc, char * argv[] )
         writeFile << "decayFactor = " << list.decayFactor.c_str() << std::endl;
         writeFile << "radionuclideHalfLife = " << list.radionuclideHalfLife.c_str() << std::endl;
         writeFile << "frameReferenceTime = " << list.frameReferenceTime.c_str() << std::endl;
+        writeFile << "seriesdimension = " << list.seriesdimension << std::endl;
         writeFile << "SUVbwConversionFactor = " << list.SUVbwConversionFactor << std::endl;
         writeFile << "SUVlbmConversionFactor = " << list.SUVlbmConversionFactor << std::endl;
         writeFile << "SUVbsaConversionFactor = " << list.SUVbsaConversionFactor << std::endl;
@@ -1180,7 +2036,7 @@ int main( int argc, char * argv[] )
       return EXIT_FAILURE;
     }
   }
-
+  //
   catch( itk::ExceptionObject & excep )
     {
     std::cerr << argv[0] << ": exception caught !" << std::endl;
@@ -1189,4 +2045,3 @@ int main( int argc, char * argv[] )
     }
   return EXIT_SUCCESS;
 }
-
